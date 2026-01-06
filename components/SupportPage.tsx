@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Loader2, User, LayoutDashboard, DollarSign, FileText, LifeBuoy, X, ArrowLeft, Info, ExternalLink, ShieldCheck, Mail, Phone, Calendar, MessageSquare, Clock, Send, Headphones, CheckCircle, ReceiptText, Euro, ShieldAlert, Percent, Fingerprint, Lock } from 'lucide-react';
+import { Search, Loader2, User, LayoutDashboard, DollarSign, FileText, LifeBuoy, X, ArrowLeft, Info, ExternalLink, ShieldCheck, Mail, Phone, Calendar, MessageSquare, Clock, Send, Headphones, CheckCircle, ReceiptText, Euro, ShieldAlert, Percent, Fingerprint } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { UserProfile, WorkRecord } from '../types';
 
@@ -26,7 +26,6 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
   const scrollToBottom = () => chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   useEffect(() => scrollToBottom(), [chatMessages]);
 
-  // Sincronização em Tempo Real da LISTA DE TICKETS (Todos os Abertos para evitar chamados perdidos)
   const fetchTickets = async () => {
     const { data } = await supabase
       .from('support_tickets')
@@ -38,40 +37,26 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
 
   useEffect(() => {
     fetchTickets();
-
     const ticketChannel = supabase.channel('nexus_support_global_queue')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'support_tickets' }, () => {
-        fetchTickets();
-      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'support_tickets' }, () => { fetchTickets(); })
       .subscribe();
-
     return () => { supabase.removeChannel(ticketChannel); };
   }, []);
 
-  // Sincronização em Tempo Real das MENSAGENS do Chat Selecionado
   useEffect(() => {
     if (activeView !== 'chat' || !selectedUser?.id) return;
-
     const fetchMsgs = async () => {
        const { data } = await supabase.from('chat_messages').select('*').eq('user_id', selectedUser.id).order('created_at', { ascending: true });
        setChatMessages(data || []);
     };
     fetchMsgs();
-
     const chatChannel = supabase.channel(`nexus_chat_agent_sync_${selectedUser.id}`)
-      .on('postgres_changes', { 
-        event: 'INSERT', 
-        schema: 'public', 
-        table: 'chat_messages', 
-        filter: `user_id=eq.${selectedUser.id}` 
-      }, payload => {
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_messages', filter: `user_id=eq.${selectedUser.id}` }, payload => {
         setChatMessages(prev => {
           if (prev.some(m => m.id === payload.new.id)) return prev;
           return [...prev, payload.new];
         });
-      })
-      .subscribe();
-
+      }).subscribe();
     return () => { supabase.removeChannel(chatChannel); };
   }, [activeView, selectedUser?.id]);
 
@@ -82,30 +67,29 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
 
   const selectUser = async (target: UserProfile) => {
     if (!target?.id) return;
-
-    // Verificar se já está a ser atendido por outro agente antes de assumir
-    const { data: ticketCheck } = await supabase
-      .from('support_tickets')
-      .select('agent_id')
-      .eq('user_id', target.id)
-      .maybeSingle();
-
-    if (ticketCheck?.agent_id && ticketCheck.agent_id !== user.id) {
-      alert("Este chat já está a ser atendido por outro agente.");
-      fetchTickets();
-      return;
-    }
-
     setLoading(true);
     
-    // Assumir o atendimento: Atualiza o agent_id para o agente atual
-    await supabase
+    // Tentar atualizar ticket para este agente
+    const { data, error: updateError } = await supabase
       .from('support_tickets')
       .update({ 
         agent_id: user.id, 
+        status: 'open',
         updated_at: new Date().toISOString() 
       })
-      .eq('user_id', target.id);
+      .eq('user_id', target.id)
+      .select();
+
+    // Se não encontrou ticket para atualizar (via pesquisa), criar novo
+    if (!updateError && (!data || data.length === 0)) {
+      await supabase.from('support_tickets').insert({
+        user_id: target.id,
+        agent_id: user.id,
+        status: 'open',
+        last_message: 'Atendimento iniciado pelo staff.',
+        updated_at: new Date().toISOString()
+      });
+    }
 
     setSelectedUser(target);
     setActiveView('chat');
@@ -120,34 +104,14 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
   const handleSendReply = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!replyText.trim() || !selectedUser?.id) return;
-    
     const currentReply = replyText;
     setReplyText('');
-    
-    // Inserir mensagem de suporte
-    await supabase.from('chat_messages').insert({ 
-      user_id: selectedUser.id, 
-      text: currentReply, 
-      sender_role: 'support' 
-    });
-    
-    // Manter o ticket atualizado e vinculado ao agente
-    await supabase.from('support_tickets').update({
-       last_message: currentReply,
-       updated_at: new Date().toISOString(),
-       agent_id: user.id
-    }).eq('user_id', selectedUser.id);
+    await supabase.from('chat_messages').insert({ user_id: selectedUser.id, text: currentReply, sender_role: 'support' });
+    await supabase.from('support_tickets').update({ last_message: currentReply, updated_at: new Date().toISOString(), agent_id: user.id }).eq('user_id', selectedUser.id);
   };
 
   const resolveTicket = async (userId: string) => {
-    await supabase
-      .from('support_tickets')
-      .update({ 
-        status: 'resolved', 
-        agent_id: user.id, 
-        updated_at: new Date().toISOString() 
-      })
-      .eq('user_id', userId);
+    await supabase.from('support_tickets').update({ status: 'resolved', agent_id: user.id, updated_at: new Date().toISOString() }).eq('user_id', userId);
     setSelectedUser(null);
     fetchTickets();
   };
@@ -157,18 +121,10 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
     if (!searchTerm.trim()) return;
     setLoading(true);
     try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('*')
-        .or(`name.ilike.%${searchTerm}%,email.ilike.%${searchTerm}%`)
-        .limit(20);
+      const { data, error } = await supabase.from('profiles').select('*').or(`name.ilike.%${searchTerm}%,email.ilike.%${searchTerm}%`).limit(20);
       if (error) throw error;
       setSearchResults(data || []);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
+    } catch (err) { console.error(err); } finally { setLoading(false); }
   };
 
   const getNexusId = (profile: any) => {
@@ -188,7 +144,6 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
           </div>
           <h2 className="text-4xl font-black text-white italic tracking-tighter uppercase">PAINEL DE <span className="text-blue-400">SUPORTE</span></h2>
         </div>
-        
         <div className="flex p-1 bg-slate-800/40 rounded-2xl border border-white/5">
            <button onClick={() => setActiveTab('active_chats')} className={`px-6 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === 'active_chats' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}>Fila de Espera ({activeChats.length})</button>
            <button onClick={() => setActiveTab('search')} className={`px-6 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === 'search' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}>Pesquisar Usuário</button>
@@ -201,7 +156,7 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
               <div className="flex items-center gap-4">
                  <button onClick={backToList} className="p-3 bg-slate-950 rounded-xl border border-slate-800 hover:text-white transition-all text-slate-500 hover:bg-slate-900"><ArrowLeft className="w-4 h-4" /></button>
                  <div>
-                    <div className="flex items-center gap-2"><div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div><p className="text-[10px] font-black text-blue-400 uppercase tracking-widest leading-none">Em Direto (Exclusivo)</p></div>
+                    <div className="flex items-center gap-2"><div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div><p className="text-[10px] font-black text-blue-400 uppercase tracking-widest leading-none">Em Atendimento</p></div>
                     <h3 className="text-xl font-black text-white uppercase italic tracking-tighter mt-1">{selectedUser.name}</h3>
                  </div>
               </div>
@@ -221,93 +176,44 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
               {activeView === 'chat' && (
                 <div className="flex flex-col h-[550px] bg-slate-950/40 rounded-[2.5rem] border border-white/5 overflow-hidden shadow-inner">
                    <div className="flex-1 overflow-y-auto p-6 space-y-4 no-scrollbar">
-                      {chatMessages.length === 0 && (
-                        <div className="h-full flex flex-col items-center justify-center opacity-20">
-                          <MessageSquare className="w-12 h-12 mb-2" />
-                          <p className="text-[10px] font-black uppercase tracking-widest">Inicie a conversa com o cliente...</p>
-                        </div>
-                      )}
                       {chatMessages.map(m => (
-                        <div key={m.id} className={`flex ${m.role === 'support' ? 'justify-end' : 'justify-start'} animate-[slideUp_0.2s_ease-out]`}>
-                           <div className={`p-4 rounded-2xl max-w-[75%] shadow-md ${m.role === 'support' ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-slate-900 text-slate-300 rounded-tl-none border border-white/5'}`}>
+                        <div key={m.id} className={`flex ${m.sender_role === 'support' ? 'justify-end' : 'justify-start'} animate-[slideUp_0.2s_ease-out]`}>
+                           <div className={`p-4 rounded-2xl max-w-[75%] shadow-md ${m.sender_role === 'support' ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-slate-900 text-slate-300 rounded-tl-none border border-white/5'}`}>
                               <p className="text-sm font-medium leading-relaxed">{m.text}</p>
-                              <p className={`text-[8px] font-black uppercase opacity-50 mt-2 ${m.role === 'support' ? 'text-right' : 'text-left'}`}>{new Date(m.created_at).toLocaleTimeString()}</p>
+                              <p className={`text-[8px] font-black uppercase opacity-50 mt-2 ${m.sender_role === 'support' ? 'text-right' : 'text-left'}`}>{new Date(m.created_at).toLocaleTimeString()}</p>
                            </div>
                         </div>
                       ))}
                       <div ref={chatEndRef} />
                    </div>
                    <form onSubmit={handleSendReply} className="p-5 bg-slate-900 border-t border-white/5 flex gap-3 items-center">
-                      <input 
-                        type="text" 
-                        value={replyText} 
-                        onChange={e => setReplyText(e.target.value)} 
-                        className="flex-1 bg-slate-950 border border-slate-800 rounded-2xl px-6 py-4 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none transition-all" 
-                        placeholder="Responder ao cliente em direto..." 
-                      />
-                      <button type="submit" disabled={!replyText.trim()} className="p-4 bg-blue-600 text-white rounded-2xl hover:bg-blue-500 transition-all disabled:opacity-20 shadow-xl group">
-                        <Send className="w-5 h-5 group-hover:translate-x-1 group-hover:-translate-y-1 transition-transform" />
-                      </button>
+                      <input type="text" value={replyText} onChange={e => setReplyText(e.target.value)} className="flex-1 bg-slate-950 border border-slate-800 rounded-2xl px-6 py-4 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none transition-all" placeholder="Responder em direto..." />
+                      <button type="submit" disabled={!replyText.trim()} className="p-4 bg-blue-600 text-white rounded-2xl hover:bg-blue-500 transition-all disabled:opacity-20 shadow-xl group"><Send className="w-5 h-5" /></button>
                    </form>
                 </div>
               )}
               {activeView === 'info' && (
                 <div className="space-y-10 animate-[fadeIn_0.5s_ease-out]">
                    <div className="flex items-center gap-6 border-b border-white/5 pb-8">
-                      <div className="w-24 h-24 bg-slate-950 border-2 border-blue-500/20 rounded-3xl flex items-center justify-center">
-                         <User className="w-12 h-12 text-blue-400" />
-                      </div>
+                      <div className="w-24 h-24 bg-slate-950 border-2 border-blue-500/20 rounded-3xl flex items-center justify-center"><User className="w-12 h-12 text-blue-400" /></div>
                       <div>
                          <h4 className="text-3xl font-black text-white italic tracking-tighter uppercase">{selectedUser.name}</h4>
-                         <p className="text-[10px] font-black text-blue-400 uppercase tracking-[0.3em] mt-1">Digital Nexus Identity: <span className="text-white">#{getNexusId(selectedUser)}</span></p>
+                         <p className="text-[10px] font-black text-blue-400 uppercase tracking-[0.3em] mt-1">Nexus Identity: <span className="text-white">#{getNexusId(selectedUser)}</span></p>
                       </div>
                    </div>
-
                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
                       <div className="space-y-6">
-                         <h5 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.3em] flex items-center gap-2"><Mail className="w-3 h-3" /> Contactos Nexus</h5>
-                         <div className="space-y-4">
-                            <div className="bg-slate-950/50 p-4 rounded-2xl border border-white/5">
-                               <p className="text-[8px] font-black text-slate-600 uppercase mb-1">E-mail Principal</p>
-                               <p className="text-sm font-bold text-white">{selectedUser.email}</p>
-                            </div>
-                            <div className="bg-slate-950/50 p-4 rounded-2xl border border-white/5">
-                               <p className="text-[8px] font-black text-slate-600 uppercase mb-1">Telemóvel</p>
-                               <p className="text-sm font-bold text-white">{selectedUser.phone || 'NÃO REGISTADO'}</p>
-                            </div>
+                         <h5 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.3em] flex items-center gap-2"><Mail className="w-3 h-3" /> Contactos</h5>
+                         <div className="bg-slate-950/50 p-4 rounded-2xl border border-white/5">
+                            <p className="text-[8px] font-black text-slate-600 uppercase mb-1">E-mail</p>
+                            <p className="text-sm font-bold text-white">{selectedUser.email}</p>
                          </div>
                       </div>
                       <div className="space-y-6">
-                         <h5 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.3em] flex items-center gap-2"><DollarSign className="w-3 h-3" /> Configuração Financeira</h5>
-                         <div className="space-y-4">
-                            <div className="bg-slate-950/50 p-4 rounded-2xl border border-white/5 flex justify-between items-center">
-                               <div>
-                                  <p className="text-[8px] font-black text-slate-600 uppercase mb-1">Valor à Hora</p>
-                                  <p className="text-lg font-black text-green-400">{f(selectedUser.hourlyRate)}</p>
-                                </div>
-                               <Euro className="w-5 h-5 text-green-500/30" />
-                            </div>
-                            <div className="bg-slate-950/50 p-4 rounded-2xl border border-white/5">
-                               <p className="text-[8px] font-black text-slate-600 uppercase mb-1">Regime Fiscal</p>
-                               <p className="text-[10px] font-black text-white uppercase">{selectedUser.isFreelancer ? 'Prestação de Serviços (IVA)' : 'Contrato de Trabalho'}</p>
-                            </div>
-                         </div>
-                      </div>
-                      <div className="space-y-6">
-                         <h5 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.3em] flex items-center gap-2"><ShieldAlert className="w-3 h-3" /> Retenções Ativas</h5>
-                         <div className="grid grid-cols-2 gap-4">
-                            <div className="bg-slate-950/50 p-4 rounded-2xl border border-white/5 text-center">
-                               <p className="text-[8px] font-black text-slate-600 uppercase mb-1">IRS</p>
-                               <p className="text-sm font-black text-rose-500">{selectedUser.irs.value}{selectedUser.irs.type === 'percentage' ? '%' : '€'}</p>
-                            </div>
-                            <div className="bg-slate-950/50 p-4 rounded-2xl border border-white/5 text-center">
-                               <p className="text-[8px] font-black text-slate-600 uppercase mb-1">S.S.</p>
-                               <p className="text-sm font-black text-blue-500">{selectedUser.socialSecurity.value}{selectedUser.socialSecurity.type === 'percentage' ? '%' : '€'}</p>
-                            </div>
-                            <div className="col-span-2 bg-slate-950/50 p-4 rounded-2xl border border-white/5 text-center">
-                               <p className="text-[8px] font-black text-slate-600 uppercase mb-1">NIF do Colaborador</p>
-                               <p className="text-sm font-black text-white tracking-widest">{selectedUser.nif || '---'}</p>
-                            </div>
+                         <h5 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.3em] flex items-center gap-2"><DollarSign className="w-3 h-3" /> Financeiro</h5>
+                         <div className="bg-slate-950/50 p-4 rounded-2xl border border-white/5">
+                            <p className="text-[8px] font-black text-slate-600 uppercase mb-1">Valor/Hora</p>
+                            <p className="text-lg font-black text-green-400">{f(selectedUser.hourlyRate)}</p>
                          </div>
                       </div>
                    </div>
@@ -320,40 +226,19 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
            {activeChats.length === 0 ? (
              <div className="col-span-full py-32 flex flex-col items-center justify-center space-y-4 opacity-30 border-2 border-dashed border-slate-800 rounded-[3rem]">
                <MessageSquare className="w-16 h-16 text-slate-600" />
-               <p className="text-[12px] font-black text-slate-600 uppercase tracking-[0.4em]">Fila de Espera Vazia</p>
+               <p className="text-[12px] font-black text-slate-600 uppercase tracking-[0.4em]">Fila Vazia</p>
              </div>
            ) : activeChats.map(ticket => {
-             const ticketProfile = getProfileFromTicket(ticket);
-             if (!ticketProfile) return null;
-             
-             const isAttendedByOther = ticket.agent_id && ticket.agent_id !== user.id;
-
+             const tp = getProfileFromTicket(ticket);
+             if (!tp) return null;
              return (
-               <button 
-                 key={ticket.id} 
-                 onClick={() => !isAttendedByOther && selectUser(ticketProfile)} 
-                 disabled={isAttendedByOther}
-                 className={`bg-slate-800/20 border border-slate-800 p-8 rounded-[2.5rem] transition-all text-left group shadow-lg relative overflow-hidden ${isAttendedByOther ? 'opacity-40 grayscale cursor-not-allowed' : 'hover:border-blue-500/50 hover:bg-slate-800/40'}`}
-               >
-                  {!isAttendedByOther && (
-                    <div className="absolute top-0 right-0 p-4"><div className="w-2 h-2 bg-blue-500 rounded-full animate-ping"></div></div>
-                  )}
+               <button key={ticket.id} onClick={() => selectUser(tp)} className="bg-slate-800/20 border border-slate-800 p-8 rounded-[2.5rem] hover:border-blue-500/50 hover:bg-slate-800/40 transition-all text-left group shadow-lg">
                   <div className="flex justify-between items-start mb-6">
-                     <div className="w-14 h-14 bg-slate-950 rounded-2xl flex items-center justify-center font-black text-blue-400 text-2xl group-hover:scale-110 transition-transform shadow-inner">{ticketProfile.name.charAt(0)}</div>
-                     <div className={`px-3 py-1.5 rounded-full border text-[8px] font-black uppercase tracking-widest ${ticket.agent_id ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-blue-500/10 text-blue-400 border-blue-500/20'}`}>
-                       {ticket.agent_id ? 'Em Atendimento' : 'Aberto'}
-                     </div>
+                     <div className="w-14 h-14 bg-slate-950 rounded-2xl flex items-center justify-center font-black text-blue-400 text-2xl">{tp.name.charAt(0)}</div>
+                     <div className="px-3 py-1.5 bg-blue-500/10 rounded-full border border-blue-500/20 text-[8px] font-black text-blue-400 uppercase">Aberto</div>
                   </div>
-                  <h4 className="text-xl font-black text-white uppercase italic tracking-tight mb-2">{ticketProfile.name}</h4>
-                  <p className="text-[11px] text-slate-400 font-medium mb-6 line-clamp-2 leading-relaxed opacity-60 group-hover:opacity-100 transition-opacity">"{ticket.last_message}"</p>
-                  <div className="flex items-center gap-2 text-[8px] font-black text-slate-600 uppercase tracking-widest mt-auto">
-                     <Clock className="w-3 h-3" /> Atualizado há {Math.floor((new Date().getTime() - new Date(ticket.updated_at).getTime()) / 60000)}m
-                  </div>
-                  {isAttendedByOther && (
-                    <div className="absolute inset-0 bg-slate-950/20 flex items-center justify-center pointer-events-none">
-                       <Lock className="w-8 h-8 text-slate-500/50" />
-                    </div>
-                  )}
+                  <h4 className="text-xl font-black text-white uppercase italic mb-2">{tp.name}</h4>
+                  <p className="text-[11px] text-slate-400 line-clamp-2">"{ticket.last_message}"</p>
                </button>
              );
            })}
@@ -361,21 +246,21 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
       ) : (
         <div className="space-y-6 animate-[fadeIn_0.3s_ease-out]">
            <form onSubmit={handleSearch} className="relative group">
-              <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500 group-focus-within:text-blue-400 transition-colors" />
-              <input type="text" placeholder="Nome ou Email do colaborador Nexus..." className="w-full bg-slate-950 border border-slate-800 rounded-[2rem] pl-16 py-6 text-white font-bold outline-none focus:ring-2 focus:ring-blue-500/30 transition-all shadow-xl" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
+              <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />
+              <input type="text" placeholder="Nome ou Email..." className="w-full bg-slate-950 border border-slate-800 rounded-[2rem] pl-16 py-6 text-white outline-none focus:ring-2 focus:ring-blue-500/30 transition-all shadow-xl" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
            </form>
            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {loading && <div className="col-span-full py-10 flex justify-center"><Loader2 className="w-8 h-8 text-blue-500 animate-spin" /></div>}
               {!loading && searchResults.map(res => (
-                <button key={res.id} onClick={() => selectUser(res)} className="flex items-center justify-between p-6 bg-slate-900/40 border border-slate-800 rounded-3xl hover:bg-slate-800/60 hover:border-blue-500/30 transition-all group shadow-md">
+                <button key={res.id} onClick={() => selectUser(res)} className="flex items-center justify-between p-6 bg-slate-900/40 border border-slate-800 rounded-3xl hover:bg-slate-800/60 transition-all">
                    <div className="flex items-center gap-5">
-                      <div className="w-12 h-12 rounded-2xl bg-slate-800 flex items-center justify-center font-black text-blue-400 shadow-inner group-hover:bg-slate-950 transition-colors">{res.name.charAt(0)}</div>
+                      <div className="w-12 h-12 rounded-2xl bg-slate-800 flex items-center justify-center font-black text-blue-400">{res.name.charAt(0)}</div>
                       <div className="text-left">
-                         <p className="text-sm font-bold text-white leading-none">{res.name}</p>
-                         <p className="text-[10px] text-slate-500 mt-2 uppercase tracking-widest font-black">{res.email}</p>
+                         <p className="text-sm font-bold text-white">{res.name}</p>
+                         <p className="text-[10px] text-slate-500 mt-2 uppercase font-black">{res.email}</p>
                       </div>
                    </div>
-                   <ExternalLink className="w-5 h-5 text-slate-700 group-hover:text-blue-400 transition-colors" />
+                   <ExternalLink className="w-5 h-5 text-slate-700" />
                 </button>
               ))}
            </div>

@@ -31,13 +31,14 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
   const [inputText, setInputText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [isHumanSupportActive, setIsHumanSupportActive] = useState(false);
-  const [agentName, setAgentName] = useState<string | null>(null);
   const [view, setView] = useState<'chat' | 'history'>('chat');
   const [resolvedTickets, setResolvedTickets] = useState<Ticket[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<'idle' | 'connecting' | 'online' | 'offline' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   const [isAgentsOnline, setIsAgentsOnline] = useState<boolean | null>(null);
+  
+  const hasInitialized = useRef(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
@@ -46,23 +47,15 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
     }, 100);
   }, []);
 
-  // Buscar nome do agente
-  const fetchAgentName = useCallback(async (agentId: string) => {
-    const { data } = await supabase.from('profiles').select('name').eq('id', agentId).single();
-    if (data) setAgentName(data.name);
-  }, []);
-
-  // Verificar se há agentes online (atividade nos últimos 2 minutos)
   const checkAgentsAvailability = useCallback(async () => {
     try {
       const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-      const { count, error } = await supabase
+      const { count } = await supabase
         .from('profiles')
         .select('*', { count: 'exact', head: true })
         .in('role', ['support', 'admin'])
         .gt('updated_at', twoMinutesAgo);
       
-      if (error) throw error;
       const online = (count || 0) > 0;
       setIsAgentsOnline(online);
       
@@ -71,7 +64,6 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
       }
       return online;
     } catch (e) {
-      console.error("Erro ao verificar agentes:", e);
       setIsAgentsOnline(false);
       return false;
     }
@@ -82,29 +74,26 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
     return () => clearInterval(interval);
   }, [checkAgentsAvailability]);
 
-  // 1. CARREGAR ESTADO INICIAL
   useEffect(() => {
     const initializeChat = async () => {
-      if (!user.id) return;
+      if (!user.id || hasInitialized.current) return;
+      hasInitialized.current = true;
       setIsLoadingHistory(true);
       await checkAgentsAvailability();
       
       try {
+        // Verificar se já existe um chamado aberto para este utilizador
         const { data: ticket } = await supabase
           .from('support_tickets')
-          .select('status, agent_id')
+          .select('status')
           .eq('user_id', user.id)
+          .eq('status', 'open')
           .maybeSingle();
 
-        const isLive = ticket?.status === 'open';
-        setIsHumanSupportActive(isLive);
-        
-        if (isLive && ticket.agent_id) {
-          fetchAgentName(ticket.agent_id);
-        } else {
-          setAgentName(null);
-        }
-        
+        const isTicketOpen = ticket?.status === 'open';
+        setIsHumanSupportActive(isTicketOpen);
+        if (isTicketOpen) setConnectionStatus('online');
+
         const { data: dbMessages, error: msgsError } = await supabase
           .from('chat_messages')
           .select('*')
@@ -125,13 +114,12 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
           setMessages([{ 
             id: 'welcome', 
             role: 'ai', 
-            text: `Olá ${user.name.split(' ')[0]}! Sou a assistente virtual da Digital Nexus Solutions. Como posso ajudar-te hoje?`, 
+            text: `Olá ${user.name.split(' ')[0]}! Sou a assistente virtual da Digital Nexus Solutions. Em que posso ajudar hoje?`, 
             timestamp: new Date() 
           }]);
         }
       } catch (err: any) {
-        console.error("Erro ao carregar chat:", err);
-        setErrorMessage("Não foi possível carregar o histórico.");
+        setErrorMessage("Erro ao carregar chat.");
       } finally {
         setIsLoadingHistory(false);
         scrollToBottom("auto");
@@ -139,24 +127,8 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
     };
 
     initializeChat();
-  }, [user.id, user.name, scrollToBottom, checkAgentsAvailability, fetchAgentName]);
+  }, [user.id, user.name, scrollToBottom, checkAgentsAvailability]);
 
-  // 2. BUSCAR HISTÓRICO
-  useEffect(() => {
-    const fetchHistory = async () => {
-      if (!user.id || view !== 'history') return;
-      const { data } = await supabase
-        .from('support_tickets')
-        .select('*')
-        .eq('user_id', user.id)
-        .eq('status', 'resolved')
-        .order('updated_at', { ascending: false });
-      setResolvedTickets(data || []);
-    };
-    fetchHistory();
-  }, [user.id, view]);
-
-  // 3. REALTIME
   useEffect(() => {
     if (!user.id) return;
 
@@ -178,87 +150,59 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
         if (updatedTicket.status === 'resolved') {
           setIsHumanSupportActive(false);
           setConnectionStatus('idle');
-          setAgentName(null);
         } else if (updatedTicket.status === 'open') {
           setIsHumanSupportActive(true);
-          if (updatedTicket.agent_id) {
-            fetchAgentName(updatedTicket.agent_id);
-          } else {
-            setAgentName(null);
-          }
-          checkAgentsAvailability();
         }
       })
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
-  }, [user.id, scrollToBottom, checkAgentsAvailability, fetchAgentName]);
+  }, [user.id, scrollToBottom, checkAgentsAvailability]);
 
-  // @google/genai logic for handling sent messages
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputText.trim()) return;
 
     const currentText = inputText;
     setInputText('');
-    const tempId = 'temp-' + Date.now();
-
-    const newUserMsg: Message = { id: tempId, role: 'user', text: currentText, timestamp: new Date() };
+    
+    const newUserMsg: Message = { id: 'temp-' + Date.now(), role: 'user', text: currentText, timestamp: new Date() };
     setMessages(prev => [...prev, newUserMsg]);
     scrollToBottom();
 
     if (isHumanSupportActive) {
-      // Send message to Supabase for human agent
-      await supabase.from('chat_messages').insert({
-        user_id: user.id,
-        text: currentText,
-        sender_role: 'user'
-      });
-      await supabase.from('support_tickets').update({
-        last_message: currentText,
-        updated_at: new Date().toISOString()
+      await supabase.from('chat_messages').insert({ user_id: user.id, text: currentText, sender_role: 'user' });
+      await supabase.from('support_tickets').update({ 
+        last_message: currentText, 
+        status: 'open',
+        updated_at: new Date().toISOString() 
       }).eq('user_id', user.id);
     } else {
-      // Logic for AI Response using Gemini API
       setIsTyping(true);
       try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        
-        const chatHistory = messages
-          .filter(m => m.role === 'user' || m.role === 'ai')
-          .map(m => ({
-            role: m.role === 'user' ? 'user' : 'model',
-            parts: [{ text: m.text }]
-          }));
+        const chatHistory = messages.filter(m => m.role !== 'support').map(m => ({
+          role: m.role === 'user' ? 'user' : 'model',
+          parts: [{ text: m.text }]
+        }));
 
         const response = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
           contents: [...chatHistory, { role: 'user', parts: [{ text: currentText }] }],
           config: {
-            systemInstruction: "Tu és a assistente virtual da Digital Nexus Solutions. Ajudas os utilizadores com a plataforma NexusTime (gestão de horas, finanças, relatórios). Sê profissional, direta e empática. Se não conseguires resolver algo técnico, sugere falar com um agente humano."
+            systemInstruction: "Tu és a assistente virtual da Digital Nexus Solutions. Sê profissional e direta. Ajuda o utilizador com o NexusTime."
           }
         });
 
-        const aiText = response.text || "Lamento, ocorreu um erro ao processar a tua resposta.";
-        const aiMsg: Message = { id: Date.now().toString(), role: 'ai', text: aiText, timestamp: new Date() };
+        const aiText = response.text || "Lamento, tente novamente.";
+        setMessages(prev => [...prev, { id: Date.now().toString(), role: 'ai', text: aiText, timestamp: new Date() }]);
         
-        setMessages(prev => [...prev, aiMsg]);
-        
-        // Persist AI chat in database
         await supabase.from('chat_messages').insert([
           { user_id: user.id, text: currentText, sender_role: 'user' },
           { user_id: user.id, text: aiText, sender_role: 'ai' }
         ]);
-
       } catch (err: any) {
-        console.error("Gemini API Error:", err);
-        const errorMsg: Message = { 
-          id: 'err-' + Date.now(), 
-          role: 'ai', 
-          text: "Lamento, estou com dificuldades técnicas de momento. Podes tentar novamente ou pedir para falar com um agente humano.", 
-          timestamp: new Date() 
-        };
-        setMessages(prev => [...prev, errorMsg]);
+        setMessages(prev => [...prev, { id: 'err-' + Date.now(), role: 'ai', text: "Erro na conexão IA.", timestamp: new Date() }]);
       } finally {
         setIsTyping(false);
         scrollToBottom();
@@ -268,36 +212,53 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
 
   const startHumanSupport = async () => {
     setConnectionStatus('connecting');
+    const triggerText = "--- SOLICITAÇÃO DE SUPORTE HUMANO ---";
+    
     try {
       const isOnline = await checkAgentsAvailability();
       
-      // Resetar status para 'open' e limpar agent_id para que apareça na fila de todos os agentes
-      const { error } = await supabase.from('support_tickets').upsert({
-        user_id: user.id,
-        status: 'open',
-        last_message: 'Solicitação de suporte humano.',
-        agent_id: null,
-        updated_at: new Date().toISOString()
-      }, { onConflict: 'user_id' });
+      // 1. Inserir a mensagem de gatilho no chat para o agente ver
+      await supabase.from('chat_messages').insert({ 
+        user_id: user.id, 
+        text: triggerText, 
+        sender_role: 'user' 
+      });
 
-      if (error) throw error;
-      
+      // 2. Abrir ou Reativar Ticket com a mensagem correta
+      const { data: updateData, error: updateError } = await supabase
+        .from('support_tickets')
+        .update({ 
+          status: 'open', 
+          last_message: triggerText, 
+          agent_id: null, 
+          updated_at: new Date().toISOString() 
+        })
+        .eq('user_id', user.id)
+        .select();
+
+      if (!updateError && (!updateData || updateData.length === 0)) {
+        await supabase.from('support_tickets').insert({ 
+          user_id: user.id, 
+          status: 'open', 
+          last_message: triggerText, 
+          updated_at: new Date().toISOString() 
+        });
+      }
+
+      // 3. Atualizar UI Local
       setIsHumanSupportActive(true);
-      setAgentName(null);
       setConnectionStatus(isOnline ? 'online' : 'offline');
       
       const sysMsg: Message = { 
         id: 'sys-' + Date.now(), 
         role: 'support', 
-        text: isOnline 
-          ? "A conectar-te a um agente de suporte... Por favor, aguarda um momento." 
-          : "De momento não há agentes online, mas a tua mensagem foi registada e responderemos assim que possível.", 
+        text: isOnline ? "A ligar a um agente... Por favor aguarde." : "Não temos agentes online agora, mas a sua mensagem foi registada no suporte.", 
         timestamp: new Date() 
       };
       setMessages(prev => [...prev, sysMsg]);
       scrollToBottom();
-    } catch (err) {
-      setConnectionStatus('error');
+    } catch (err: any) {
+      alert("Erro ao ligar ao suporte.");
     }
   };
 
@@ -313,10 +274,8 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
             <div className="flex items-center gap-2 mt-1">
               {isHumanSupportActive ? (
                 <>
-                  <div className={`w-2 h-2 rounded-full ${agentName ? 'bg-green-500 animate-pulse' : 'bg-orange-500 animate-bounce'}`}></div>
-                  <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">
-                    {agentName ? `Em atendimento por ${agentName}` : 'A aguardar agente...'}
-                  </span>
+                  <div className={`w-2 h-2 rounded-full ${connectionStatus === 'online' ? 'bg-green-500 animate-pulse' : 'bg-orange-500'}`}></div>
+                  <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">{connectionStatus === 'online' ? 'Agente em Direto' : 'A aguardar agente...'}</span>
                 </>
               ) : (
                 <>
@@ -340,7 +299,7 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
               {isLoadingHistory ? (
                 <div className="h-full flex flex-col items-center justify-center space-y-4 opacity-50">
                   <Loader2 className="w-8 h-8 animate-spin" />
-                  <p className="text-[10px] font-black uppercase tracking-widest">A carregar conversa...</p>
+                  <p className="text-[10px] font-black uppercase tracking-widest">A carregar...</p>
                 </div>
               ) : (
                 messages.map((m, idx) => (
@@ -397,13 +356,13 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
       ) : (
         <div className="bg-slate-800/20 border border-slate-800 rounded-[3rem] p-8 space-y-6 min-h-[500px]">
            <h3 className="text-sm font-black text-white uppercase tracking-widest flex items-center gap-3">
-             <History className="w-5 h-5 text-blue-400" /> Histórico de Chamados
+             <History className="w-5 h-5 text-blue-400" /> Histórico
            </h3>
            <div className="grid grid-cols-1 gap-4">
               {resolvedTickets.length === 0 ? (
                 <div className="py-20 text-center opacity-30">
                   <MessageSquare className="w-12 h-12 mx-auto mb-4" />
-                  <p className="text-[10px] font-black uppercase tracking-widest">Nenhum chamado anterior.</p>
+                  <p className="text-[10px] font-black uppercase tracking-widest">Sem chamados resolvidos.</p>
                 </div>
               ) : resolvedTickets.map(t => (
                 <div key={t.id} className="p-6 bg-slate-900/40 border border-white/5 rounded-2xl flex justify-between items-center group hover:border-blue-500/30 transition-all">
