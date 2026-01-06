@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Loader2, User, LayoutDashboard, DollarSign, FileText, LifeBuoy, X, ArrowLeft, Info, ExternalLink, ShieldCheck, Mail, Phone, Calendar, MessageSquare, Clock, Send, Headphones, CheckCircle, ReceiptText, Euro, ShieldAlert, Percent, Fingerprint } from 'lucide-react';
+import { Search, Loader2, User, LayoutDashboard, DollarSign, FileText, LifeBuoy, X, ArrowLeft, Info, ExternalLink, ShieldCheck, Mail, Phone, Calendar, MessageSquare, Clock, Send, Headphones, CheckCircle, ReceiptText, Euro, ShieldAlert, Percent, Fingerprint, Lock } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { UserProfile, WorkRecord } from '../types';
 
@@ -82,9 +82,23 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
 
   const selectUser = async (target: UserProfile) => {
     if (!target?.id) return;
+
+    // Verificar se já está a ser atendido por outro agente antes de assumir
+    const { data: ticketCheck } = await supabase
+      .from('support_tickets')
+      .select('agent_id')
+      .eq('user_id', target.id)
+      .maybeSingle();
+
+    if (ticketCheck?.agent_id && ticketCheck.agent_id !== user.id) {
+      alert("Este chat já está a ser atendido por outro agente.");
+      fetchTickets();
+      return;
+    }
+
     setLoading(true);
     
-    // Assumir o atendimento: Atualiza o agent_id para o agente atual, independente de quem estava antes
+    // Assumir o atendimento: Atualiza o agent_id para o agente atual
     await supabase
       .from('support_tickets')
       .update({ 
@@ -214,10 +228,10 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
                         </div>
                       )}
                       {chatMessages.map(m => (
-                        <div key={m.id} className={`flex ${m.sender_role === 'support' ? 'justify-end' : 'justify-start'} animate-[slideUp_0.2s_ease-out]`}>
-                           <div className={`p-4 rounded-2xl max-w-[75%] shadow-md ${m.sender_role === 'support' ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-slate-900 text-slate-300 rounded-tl-none border border-white/5'}`}>
+                        <div key={m.id} className={`flex ${m.role === 'support' ? 'justify-end' : 'justify-start'} animate-[slideUp_0.2s_ease-out]`}>
+                           <div className={`p-4 rounded-2xl max-w-[75%] shadow-md ${m.role === 'support' ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-slate-900 text-slate-300 rounded-tl-none border border-white/5'}`}>
                               <p className="text-sm font-medium leading-relaxed">{m.text}</p>
-                              <p className={`text-[8px] font-black uppercase opacity-50 mt-2 ${m.sender_role === 'support' ? 'text-right' : 'text-left'}`}>{new Date(m.created_at).toLocaleTimeString()}</p>
+                              <p className={`text-[8px] font-black uppercase opacity-50 mt-2 ${m.role === 'support' ? 'text-right' : 'text-left'}`}>{new Date(m.created_at).toLocaleTimeString()}</p>
                            </div>
                         </div>
                       ))}
@@ -312,9 +326,18 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
              const ticketProfile = getProfileFromTicket(ticket);
              if (!ticketProfile) return null;
              
+             const isAttendedByOther = ticket.agent_id && ticket.agent_id !== user.id;
+
              return (
-               <button key={ticket.id} onClick={() => selectUser(ticketProfile)} className="bg-slate-800/20 border border-slate-800 p-8 rounded-[2.5rem] hover:border-blue-500/50 hover:bg-slate-800/40 transition-all text-left group shadow-lg relative overflow-hidden">
-                  <div className="absolute top-0 right-0 p-4"><div className="w-2 h-2 bg-blue-500 rounded-full animate-ping"></div></div>
+               <button 
+                 key={ticket.id} 
+                 onClick={() => !isAttendedByOther && selectUser(ticketProfile)} 
+                 disabled={isAttendedByOther}
+                 className={`bg-slate-800/20 border border-slate-800 p-8 rounded-[2.5rem] transition-all text-left group shadow-lg relative overflow-hidden ${isAttendedByOther ? 'opacity-40 grayscale cursor-not-allowed' : 'hover:border-blue-500/50 hover:bg-slate-800/40'}`}
+               >
+                  {!isAttendedByOther && (
+                    <div className="absolute top-0 right-0 p-4"><div className="w-2 h-2 bg-blue-500 rounded-full animate-ping"></div></div>
+                  )}
                   <div className="flex justify-between items-start mb-6">
                      <div className="w-14 h-14 bg-slate-950 rounded-2xl flex items-center justify-center font-black text-blue-400 text-2xl group-hover:scale-110 transition-transform shadow-inner">{ticketProfile.name.charAt(0)}</div>
                      <div className={`px-3 py-1.5 rounded-full border text-[8px] font-black uppercase tracking-widest ${ticket.agent_id ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-blue-500/10 text-blue-400 border-blue-500/20'}`}>
@@ -326,6 +349,11 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
                   <div className="flex items-center gap-2 text-[8px] font-black text-slate-600 uppercase tracking-widest mt-auto">
                      <Clock className="w-3 h-3" /> Atualizado há {Math.floor((new Date().getTime() - new Date(ticket.updated_at).getTime()) / 60000)}m
                   </div>
+                  {isAttendedByOther && (
+                    <div className="absolute inset-0 bg-slate-950/20 flex items-center justify-center pointer-events-none">
+                       <Lock className="w-8 h-8 text-slate-500/50" />
+                    </div>
+                  )}
                </button>
              );
            })}
