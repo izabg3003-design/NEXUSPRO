@@ -51,6 +51,19 @@ const App: React.FC = () => {
   const isInitialLoad = useRef(true);
   const notificationChecked = useRef(false);
 
+  // Heartbeat para Suporte/Admin para manter status "Online"
+  useEffect(() => {
+    if (!user.id || (user.role !== 'support' && user.role !== 'admin' && user.email !== 'master@digitalnexus.com')) return;
+    
+    const pingPresence = async () => {
+      await supabase.from('profiles').update({ updated_at: new Date().toISOString() }).eq('id', user.id);
+    };
+    
+    pingPresence();
+    const interval = setInterval(pingPresence, 60000); // Atualiza a cada 1 minuto
+    return () => clearInterval(interval);
+  }, [user.id, user.role, user.email]);
+
   const t = useCallback((key: string): any => {
     const activeLang = user.settings?.language || systemLang;
     const parts = key.split('.');

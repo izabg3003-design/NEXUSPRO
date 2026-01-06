@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef } from 'react';
 import { Search, Loader2, User, LayoutDashboard, DollarSign, FileText, LifeBuoy, X, ArrowLeft, Info, ExternalLink, ShieldCheck, Mail, Phone, Calendar, MessageSquare, Clock, Send, Headphones, CheckCircle, ReceiptText, Euro, ShieldAlert, Percent, Fingerprint } from 'lucide-react';
 import { supabase } from '../lib/supabase';
@@ -19,25 +18,37 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
   const [activeView, setActiveView] = useState<'info' | 'dashboard' | 'chat'>('chat');
   
   const [activeChats, setActiveChats] = useState<any[]>([]);
+  const [resolvedTickets, setResolvedTickets] = useState<any[]>([]);
   const [chatMessages, setChatMessages] = useState<any[]>([]);
   const [replyText, setReplyText] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const replyingRef = useRef(false);
 
   const scrollToBottom = () => chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   useEffect(() => scrollToBottom(), [chatMessages]);
 
   const fetchTickets = async () => {
-    const { data } = await supabase
+    // Buscar ativos
+    const { data: active } = await supabase
       .from('support_tickets')
       .select('*, profiles(*)')
       .eq('status', 'open')
       .order('updated_at', { ascending: false });
-    setActiveChats(data || []);
+    setActiveChats(active || []);
+
+    // Buscar resolvidos
+    const { data: resolved } = await supabase
+      .from('support_tickets')
+      .select('*, profiles(*)')
+      .eq('status', 'resolved')
+      .order('updated_at', { ascending: false })
+      .limit(50);
+    setResolvedTickets(resolved || []);
   };
 
   useEffect(() => {
     fetchTickets();
-    const ticketChannel = supabase.channel('nexus_support_global_queue')
+    const ticketChannel = supabase.channel('nexus_support_global_sync')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'support_tickets' }, () => { fetchTickets(); })
       .subscribe();
     return () => { supabase.removeChannel(ticketChannel); };
@@ -69,22 +80,21 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
     if (!target?.id) return;
     setLoading(true);
     
-    // Tentar atualizar ticket para este agente
+    // Tentar atualizar ticket para este agente (removido agent_id por erro de esquema)
     const { data, error: updateError } = await supabase
       .from('support_tickets')
       .update({ 
-        agent_id: user.id, 
         status: 'open',
         updated_at: new Date().toISOString() 
       })
       .eq('user_id', target.id)
+      .eq('status', 'open')
       .select();
 
     // Se não encontrou ticket para atualizar (via pesquisa), criar novo
     if (!updateError && (!data || data.length === 0)) {
       await supabase.from('support_tickets').insert({
         user_id: target.id,
-        agent_id: user.id,
         status: 'open',
         last_message: 'Atendimento iniciado pelo staff.',
         updated_at: new Date().toISOString()
@@ -103,17 +113,69 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
 
   const handleSendReply = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!replyText.trim() || !selectedUser?.id) return;
-    const currentReply = replyText;
+    if (!replyText.trim() || !selectedUser?.id || replyingRef.current) return;
+    
+    const currentReply = replyText.trim();
     setReplyText('');
-    await supabase.from('chat_messages').insert({ user_id: selectedUser.id, text: currentReply, sender_role: 'support' });
-    await supabase.from('support_tickets').update({ last_message: currentReply, updated_at: new Date().toISOString(), agent_id: user.id }).eq('user_id', selectedUser.id);
+    replyingRef.current = true;
+    
+    try {
+      await supabase.from('chat_messages').insert({ user_id: selectedUser.id, text: currentReply, sender_role: 'support' });
+      await supabase.from('support_tickets').update({ 
+        last_message: currentReply, 
+        updated_at: new Date().toISOString() 
+      }).eq('user_id', selectedUser.id).eq('status', 'open');
+    } catch (err) {
+      console.error("Error sending reply:", err);
+    } finally {
+      replyingRef.current = false;
+    }
   };
 
   const resolveTicket = async (userId: string) => {
-    await supabase.from('support_tickets').update({ status: 'resolved', agent_id: user.id, updated_at: new Date().toISOString() }).eq('user_id', userId);
-    setSelectedUser(null);
-    fetchTickets();
+    if (!userId || loading) return;
+    setLoading(true);
+    try {
+      const { error } = await supabase
+        .from('support_tickets')
+        .update({ 
+          status: 'resolved', 
+          updated_at: new Date().toISOString() 
+        })
+        .eq('user_id', userId)
+        .neq('status', 'resolved');
+
+      if (error) throw error;
+
+      setSelectedUser(null);
+      await fetchTickets();
+    } catch (err: any) {
+      let displayMsg = "Erro na comunicação com o servidor.";
+      
+      if (err) {
+        if (typeof err === 'string') {
+          displayMsg = err;
+        } else if (err.message) {
+          displayMsg = err.message;
+        } else if (err.error_description) {
+          displayMsg = err.error_description;
+        } else if (err.details) {
+          displayMsg = err.details;
+        } else {
+          try {
+            const stringified = JSON.stringify(err);
+            displayMsg = (stringified === '{}' || stringified === 'undefined') ? "Erro técnico (dados não legíveis)" : stringified;
+          } catch {
+            displayMsg = "Falha crítica de resposta do servidor.";
+          }
+        }
+      }
+
+      console.error("Nexus Resolve Error Details:", displayMsg);
+      alert(`Erro ao encerrar ticket: ${displayMsg}`);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleSearch = async (e: React.FormEvent) => {
@@ -144,9 +206,10 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
           </div>
           <h2 className="text-4xl font-black text-white italic tracking-tighter uppercase">PAINEL DE <span className="text-blue-400">SUPORTE</span></h2>
         </div>
-        <div className="flex p-1 bg-slate-800/40 rounded-2xl border border-white/5">
-           <button onClick={() => setActiveTab('active_chats')} className={`px-6 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === 'active_chats' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}>Fila de Espera ({activeChats.length})</button>
-           <button onClick={() => setActiveTab('search')} className={`px-6 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === 'search' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}>Pesquisar Usuário</button>
+        <div className="flex p-1 bg-slate-800/40 rounded-2xl border border-white/5 overflow-x-auto no-scrollbar">
+           <button onClick={() => setActiveTab('active_chats')} className={`px-6 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap ${activeTab === 'active_chats' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}>Fila ({activeChats.length})</button>
+           <button onClick={() => setActiveTab('resolved')} className={`px-6 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap ${activeTab === 'resolved' ? 'bg-green-600 text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}>Resolvidos ({resolvedTickets.length})</button>
+           <button onClick={() => setActiveTab('search')} className={`px-6 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap ${activeTab === 'search' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}>Pesquisar</button>
         </div>
       </div>
 
@@ -161,7 +224,10 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
                  </div>
               </div>
               <div className="flex gap-2">
-                 <button onClick={() => resolveTicket(selectedUser.id!)} className="px-5 py-2.5 bg-green-600 text-white rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 hover:bg-green-500 transition-all shadow-lg"><CheckCircle className="w-4 h-4" /> Marcar Resolvido</button>
+                 <button onClick={() => resolveTicket(selectedUser.id!)} disabled={loading} className="px-5 py-2.5 bg-green-600 text-white rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 hover:bg-green-500 transition-all shadow-lg disabled:opacity-50">
+                   {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} 
+                   Marcar Resolvido
+                 </button>
                  <div className="bg-slate-950/50 p-1.5 rounded-2xl border border-slate-800 flex">
                     {[{ id: 'chat', label: 'Conversa', icon: MessageSquare }, { id: 'info', label: 'Ficha Nexus', icon: Info }].map(v => (
                         <button key={v.id} onClick={() => setActiveView(v.id as any)} className={`px-5 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 transition-all ${activeView === v.id ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-white'}`}>
@@ -188,7 +254,7 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
                    </div>
                    <form onSubmit={handleSendReply} className="p-5 bg-slate-900 border-t border-white/5 flex gap-3 items-center">
                       <input type="text" value={replyText} onChange={e => setReplyText(e.target.value)} className="flex-1 bg-slate-950 border border-slate-800 rounded-2xl px-6 py-4 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none transition-all" placeholder="Responder em direto..." />
-                      <button type="submit" disabled={!replyText.trim()} className="p-4 bg-blue-600 text-white rounded-2xl hover:bg-blue-500 transition-all disabled:opacity-20 shadow-xl group"><Send className="w-5 h-5" /></button>
+                      <button type="submit" disabled={!replyText.trim() || replyingRef.current} className="p-4 bg-blue-600 text-white rounded-2xl hover:bg-blue-500 transition-all disabled:opacity-20 shadow-xl group"><Send className="w-5 h-5" /></button>
                    </form>
                 </div>
               )}
@@ -240,6 +306,29 @@ const SupportPage: React.FC<Props> = ({ user, f, t }) => {
                   <h4 className="text-xl font-black text-white uppercase italic mb-2">{tp.name}</h4>
                   <p className="text-[11px] text-slate-400 line-clamp-2">"{ticket.last_message}"</p>
                </button>
+             );
+           })}
+        </div>
+      ) : activeTab === 'resolved' ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 animate-[fadeIn_0.3s_ease-out]">
+           {resolvedTickets.length === 0 ? (
+             <div className="col-span-full py-32 flex flex-col items-center justify-center space-y-4 opacity-30 border-2 border-dashed border-slate-800 rounded-[3rem]">
+               <CheckCircle className="w-16 h-16 text-slate-600" />
+               <p className="text-[12px] font-black text-slate-600 uppercase tracking-[0.4em]">Sem Histórico</p>
+             </div>
+           ) : resolvedTickets.map(ticket => {
+             const tp = getProfileFromTicket(ticket);
+             if (!tp) return null;
+             return (
+               <div key={ticket.id} className="bg-slate-900/40 border border-slate-800 p-8 rounded-[2.5rem] text-left group shadow-lg opacity-80">
+                  <div className="flex justify-between items-start mb-6">
+                     <div className="w-14 h-14 bg-slate-950 rounded-2xl flex items-center justify-center font-black text-slate-500 text-2xl">{tp.name.charAt(0)}</div>
+                     <div className="px-3 py-1.5 bg-green-500/10 rounded-full border border-green-500/20 text-[8px] font-black text-green-400 uppercase">Resolvido</div>
+                  </div>
+                  <h4 className="text-xl font-black text-white uppercase italic mb-2">{tp.name}</h4>
+                  <p className="text-[10px] text-slate-500 uppercase font-black mb-4 flex items-center gap-2"><Clock className="w-3 h-3" /> {new Date(ticket.updated_at).toLocaleDateString()}</p>
+                  <p className="text-[11px] text-slate-500 italic">"{ticket.last_message}"</p>
+               </div>
              );
            })}
         </div>

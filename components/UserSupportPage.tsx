@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Bot, User, LifeBuoy, Loader2, Sparkles, MessageSquare, Headphones, ArrowLeft, History, Wifi, AlertTriangle, CheckCircle2, Clock, Info, Moon, Sun } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
@@ -30,6 +29,7 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [isSending, setIsSending] = useState(false);
   const [isHumanSupportActive, setIsHumanSupportActive] = useState(false);
   const [view, setView] = useState<'chat' | 'history'>('chat');
   const [resolvedTickets, setResolvedTickets] = useState<Ticket[]>([]);
@@ -40,6 +40,7 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
   
   const hasInitialized = useRef(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const sendingRef = useRef(false);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     setTimeout(() => {
@@ -49,13 +50,14 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
 
   const checkAgentsAvailability = useCallback(async () => {
     try {
-      const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-      const { count } = await supabase
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      const { count, error } = await supabase
         .from('profiles')
         .select('*', { count: 'exact', head: true })
-        .in('role', ['support', 'admin'])
-        .gt('updated_at', twoMinutesAgo);
+        .or(`role.in.("support","admin"),email.eq.master@digitalnexus.com`)
+        .gt('updated_at', fiveMinutesAgo);
       
+      if (error) throw error;
       const online = (count || 0) > 0;
       setIsAgentsOnline(online);
       
@@ -82,7 +84,6 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
       await checkAgentsAvailability();
       
       try {
-        // Verificar se já existe um chamado aberto para este utilizador
         const { data: ticket } = await supabase
           .from('support_tickets')
           .select('status')
@@ -135,13 +136,20 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
     const channel = supabase.channel(`nexus_chat_sync_${user.id}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_messages', filter: `user_id=eq.${user.id}` }, payload => {
         const msg = payload.new;
+        if (!msg || !msg.id) return;
+
         setMessages(prev => {
           if (prev.some(m => m.id === msg.id)) return prev;
           if (msg.sender_role === 'support') {
             setIsHumanSupportActive(true);
             setConnectionStatus('online');
           }
-          return [...prev, { id: msg.id, role: msg.sender_role as any, text: msg.text, timestamp: new Date(msg.created_at) }];
+          return [...prev, { 
+            id: msg.id, 
+            role: msg.sender_role as any, 
+            text: msg.text, 
+            timestamp: new Date(msg.created_at) 
+          }];
         });
         scrollToBottom();
       })
@@ -161,22 +169,27 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim()) return;
+    if (!inputText.trim() || isSending || sendingRef.current) return;
 
-    const currentText = inputText;
+    const currentText = inputText.trim();
     setInputText('');
-    
-    const newUserMsg: Message = { id: 'temp-' + Date.now(), role: 'user', text: currentText, timestamp: new Date() };
-    setMessages(prev => [...prev, newUserMsg]);
-    scrollToBottom();
+    setIsSending(true);
+    sendingRef.current = true;
 
     if (isHumanSupportActive) {
-      await supabase.from('chat_messages').insert({ user_id: user.id, text: currentText, sender_role: 'user' });
-      await supabase.from('support_tickets').update({ 
-        last_message: currentText, 
-        status: 'open',
-        updated_at: new Date().toISOString() 
-      }).eq('user_id', user.id);
+      try {
+        await supabase.from('chat_messages').insert({ user_id: user.id, text: currentText, sender_role: 'user' });
+        await supabase.from('support_tickets').update({ 
+          last_message: currentText, 
+          status: 'open',
+          updated_at: new Date().toISOString() 
+        }).eq('user_id', user.id);
+      } catch (err) {
+        console.error("Error sending message:", err);
+      } finally {
+        setIsSending(false);
+        sendingRef.current = false;
+      }
     } else {
       setIsTyping(true);
       try {
@@ -195,7 +208,6 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
         });
 
         const aiText = response.text || "Lamento, tente novamente.";
-        setMessages(prev => [...prev, { id: Date.now().toString(), role: 'ai', text: aiText, timestamp: new Date() }]);
         
         await supabase.from('chat_messages').insert([
           { user_id: user.id, text: currentText, sender_role: 'user' },
@@ -205,38 +217,39 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
         setMessages(prev => [...prev, { id: 'err-' + Date.now(), role: 'ai', text: "Erro na conexão IA.", timestamp: new Date() }]);
       } finally {
         setIsTyping(false);
+        setIsSending(false);
+        sendingRef.current = false;
         scrollToBottom();
       }
     }
   };
 
   const startHumanSupport = async () => {
+    if (sendingRef.current) return;
     setConnectionStatus('connecting');
-    const triggerText = "--- SOLICITAÇÃO DE SUPORTE HUMANO ---";
+    sendingRef.current = true;
+    const triggerText = "O utilizador solicitou falar com um atendente humano agora.";
     
     try {
       const isOnline = await checkAgentsAvailability();
       
-      // 1. Inserir a mensagem de gatilho no chat para o agente ver
       await supabase.from('chat_messages').insert({ 
         user_id: user.id, 
-        text: triggerText, 
+        text: "--- SOLICITAÇÃO DE ATENDIMENTO HUMANO ---", 
         sender_role: 'user' 
       });
 
-      // 2. Abrir ou Reativar Ticket com a mensagem correta
-      const { data: updateData, error: updateError } = await supabase
+      const { data: updateData } = await supabase
         .from('support_tickets')
         .update({ 
           status: 'open', 
           last_message: triggerText, 
-          agent_id: null, 
           updated_at: new Date().toISOString() 
         })
         .eq('user_id', user.id)
         .select();
 
-      if (!updateError && (!updateData || updateData.length === 0)) {
+      if (!updateData || updateData.length === 0) {
         await supabase.from('support_tickets').insert({ 
           user_id: user.id, 
           status: 'open', 
@@ -245,20 +258,23 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
         });
       }
 
-      // 3. Atualizar UI Local
       setIsHumanSupportActive(true);
       setConnectionStatus(isOnline ? 'online' : 'offline');
       
       const sysMsg: Message = { 
         id: 'sys-' + Date.now(), 
         role: 'support', 
-        text: isOnline ? "A ligar a um agente... Por favor aguarde." : "Não temos agentes online agora, mas a sua mensagem foi registada no suporte.", 
+        text: isOnline ? "Ligação estabelecida com o suporte da Digital Nexus. Por favor aguarde um momento." : "A sua solicitação de suporte foi registada. Responderemos assim que um agente estiver online.", 
         timestamp: new Date() 
       };
+      
       setMessages(prev => [...prev, sysMsg]);
       scrollToBottom();
     } catch (err: any) {
-      alert("Erro ao ligar ao suporte.");
+      console.error("Support trigger error:", err);
+      alert("Erro ao ligar ao suporte. Verifique a sua conexão.");
+    } finally {
+      sendingRef.current = false;
     }
   };
 
@@ -275,7 +291,7 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
               {isHumanSupportActive ? (
                 <>
                   <div className={`w-2 h-2 rounded-full ${connectionStatus === 'online' ? 'bg-green-500 animate-pulse' : 'bg-orange-500'}`}></div>
-                  <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">{connectionStatus === 'online' ? 'Agente em Direto' : 'A aguardar agente...'}</span>
+                  <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">{connectionStatus === 'online' ? 'Agente em Direto' : 'Suporte Offline (Mensagem Registada)'}</span>
                 </>
               ) : (
                 <>
@@ -345,10 +361,11 @@ const UserSupportPage: React.FC<Props> = ({ user, t }) => {
                    value={inputText} 
                    onChange={e => setInputText(e.target.value)} 
                    placeholder="Diz-me algo ou coloca uma dúvida..." 
-                   className="flex-1 bg-transparent px-4 py-2 text-white text-sm outline-none placeholder:text-slate-600 font-medium"
+                   disabled={isSending}
+                   className="flex-1 bg-transparent px-4 py-2 text-white text-sm outline-none placeholder:text-slate-600 font-medium disabled:opacity-50"
                  />
-                 <button type="submit" disabled={!inputText.trim()} className="w-12 h-12 bg-blue-600 hover:bg-blue-500 text-white rounded-full flex items-center justify-center transition-all shadow-lg active:scale-95 disabled:opacity-20 group">
-                   <Send className="w-5 h-5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+                 <button type="submit" disabled={!inputText.trim() || isSending} className="w-12 h-12 bg-blue-600 hover:bg-blue-500 text-white rounded-full flex items-center justify-center transition-all shadow-lg active:scale-95 disabled:opacity-20 group">
+                   {isSending ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />}
                  </button>
               </form>
            </div>
